@@ -119,6 +119,11 @@ func (m *Manager) registered(ctx context.Context, cli *whatsmeow.Client, jid typ
 	if len(res) == 0 || !res[0].IsIn {
 		return jid, ErrNumberNotFound
 	}
+	// The lookup answers with the LID; the 1.x contract reports <number>@c.us. Sending to the
+	// number is fine: whatsmeow encrypts for the LID the lookup has just stored for it.
+	if pn := res[0].PhoneNumber; pn.Server == types.DefaultUserServer {
+		return pn.ToNonAD(), nil
+	}
 	return res[0].JID.ToNonAD(), nil
 }
 
