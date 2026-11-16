@@ -442,7 +442,7 @@
   },
   "info": {
     "title": "WhatsApp API Gateway",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "description": "REST gateway over WhatsApp (whatsmeow, linked device — no browser). Paths, bodies and error codes are those of 1.x. No endpoint requires a token: keep the gateway on the internal network."
   },
   "paths": {
