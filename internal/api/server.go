@@ -130,7 +130,11 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	if n, age, err := s.st.OutboxBacklog(ctx); err == nil {
-		body["outbox"] = map[string]any{"pending": n, "oldestSec": int64(age.Seconds())}
+		outbox := map[string]any{"pending": n, "oldestSec": int64(age.Seconds())}
+		if u, err := s.st.Unrouted(ctx); err == nil {
+			outbox["unroutedLastDay"] = u
+		}
+		body["outbox"] = outbox
 	}
 	if e := s.wa.LastError(); e != "" {
 		body["lastError"] = e
@@ -406,8 +410,12 @@ func decodeFiles(w http.ResponseWriter, in []fileDTO) ([]wa.Attachment, bool) {
 // A key whose send fails is released, so the retry goes through.
 func (s *Server) idempotent(w http.ResponseWriter, r *http.Request, rawKey string, send func(context.Context) (wa.SendResult, error)) {
 	key := strings.TrimSpace(rawKey)
+	// Once started, a send runs to the end even if the caller hangs up: WhatsApp may already have the
+	// message, and a cancelled send would release the key and let the retry deliver it twice.
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Minute)
+	defer cancel()
 	if key == "" {
-		res, err := send(r.Context())
+		res, err := send(sendCtx)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -429,7 +437,7 @@ func (s *Server) idempotent(w http.ResponseWriter, r *http.Request, rawKey strin
 			MessageID: prev.MessageID, Deduplicated: true})
 		return
 	}
-	res, err := send(r.Context())
+	res, err := send(sendCtx)
 	if err != nil {
 		if rerr := s.st.ReleaseKey(context.WithoutCancel(r.Context()), key); rerr != nil {
 			s.log.Warn("Idempotency key not released", "key", key, "err", rerr)
@@ -449,7 +457,7 @@ func (s *Server) idempotent(w http.ResponseWriter, r *http.Request, rawKey strin
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	var se *wa.SendError
 	switch {
-	case errors.Is(err, wa.ErrNotLoggedIn):
+	case errors.Is(err, wa.ErrNotLoggedIn), errors.Is(err, wa.ErrNotStarted):
 		writeErr(w, http.StatusServiceUnavailable, "WA_NOT_LOGGED_IN", fmt.Sprintf(
 			"WhatsApp is not logged in (status: %s). Call POST /session/login and scan the QR at GET /session/qr.", s.wa.Status()), nil)
 	case errors.Is(err, wa.ErrNotReady):

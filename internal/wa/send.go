@@ -111,6 +111,9 @@ func (m *Manager) SendToChat(ctx context.Context, chatID, text string, files []A
 func (m *Manager) registered(ctx context.Context, cli *whatsmeow.Client, jid types.JID) (types.JID, error) {
 	res, err := cli.IsOnWhatsApp(ctx, []string{"+" + jid.User})
 	if err != nil {
+		if errors.Is(err, whatsmeow.ErrNotConnected) || errors.Is(err, whatsmeow.ErrNotLoggedIn) {
+			return jid, ErrNotReady
+		}
 		return jid, &SendError{fmt.Errorf("number check: %w", err)}
 	}
 	if len(res) == 0 || !res[0].IsIn {
@@ -197,6 +200,10 @@ func (m *Manager) dispatch(ctx context.Context, cli *whatsmeow.Client, to types.
 		}
 		m.lastSend = time.Now()
 		if err != nil {
+			if res.SentMessages > 0 {
+				m.log.Warn("Send stopped part way; the caller's retry re-sends the whole message (at-least-once)",
+					"chatId", chat, "sent", res.SentMessages, "of", len(queue))
+			}
 			if errors.Is(err, whatsmeow.ErrNotLoggedIn) || errors.Is(err, whatsmeow.ErrNotConnected) {
 				return res, ErrNotReady
 			}

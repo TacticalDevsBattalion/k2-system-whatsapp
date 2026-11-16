@@ -169,6 +169,13 @@ type groupCache struct {
 	ordered []*types.GroupInfo
 }
 
+// reset forgets the cached groups (a new client may be a different account).
+func (c *groupCache) reset() {
+	c.mu.Lock()
+	c.byJID, c.ordered, c.at = nil, nil, time.Time{}
+	c.mu.Unlock()
+}
+
 func (c *groupCache) all(ctx context.Context, cli *whatsmeow.Client) ([]*types.GroupInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

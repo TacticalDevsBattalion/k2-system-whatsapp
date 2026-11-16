@@ -39,6 +39,16 @@ type OutboxEvent struct {
 func (s *Store) SaveInbound(ctx context.Context, m Message, publish *OutboxEvent) (bool, error) {
 	fresh := false
 	err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		// Deduplicate on the stanza id alone: the same message redelivered after a LID got mapped to
+		// a phone number comes with a different chat id (…@lid → …@c.us).
+		var seen bool
+		// Stanza ids are random (16–20 hex digits), so the id alone is a safe key.
+		if err := tx.QueryRow(ctx, `select exists(select 1 from wa_messages where id = $1)`, m.ID).Scan(&seen); err != nil {
+			return err
+		}
+		if seen {
+			return nil
+		}
 		tag, err := tx.Exec(ctx, `insert into wa_messages (chat_id, id, sender, from_me, ts, type, body, has_media, raw)
 			values ($1, $2, $3, $4, $5, $6, $7, $8, $9) on conflict (chat_id, id) do nothing`,
 			m.Chat, m.ID, m.Sender, m.FromMe, m.Time, m.Type, m.Body, m.HasMedia, m.Raw)
@@ -96,11 +106,12 @@ func (s *Store) SaveSent(ctx context.Context, m Message) error {
 	return err
 }
 
-// FindMessage looks a message up by stanza id; chat narrows it when known.
+// FindMessage looks a message up by stanza id, preferring the given chat (the same message can
+// sit under its @lid and its @c.us id).
 func (s *Store) FindMessage(ctx context.Context, chat, id string) (Message, error) {
 	var m Message
 	row := s.Pool.QueryRow(ctx, `select chat_id, id, sender, from_me, ts, type, body, has_media, raw from wa_messages
-		where id = $1 and ($2 = '' or chat_id = $2) order by ts desc limit 1`, id, chat)
+		where id = $1 order by (chat_id = $2) desc, ts desc limit 1`, id, chat)
 	err := row.Scan(&m.Chat, &m.ID, &m.Sender, &m.FromMe, &m.Time, &m.Type, &m.Body, &m.HasMedia, &m.Raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
@@ -127,9 +138,17 @@ func (s *Store) PendingOutbox(ctx context.Context, limit int) ([]OutboxEvent, er
 	return out, rows.Err()
 }
 
-func (s *Store) MarkPublished(ctx context.Context, seq int64) error {
-	_, err := s.Pool.Exec(ctx, `update wa_outbox set published_at = now() where seq = $1`, seq)
+// MarkPublished records the broker's confirm; unrouted says no queue took the event.
+func (s *Store) MarkPublished(ctx context.Context, seq int64, unrouted bool) error {
+	_, err := s.Pool.Exec(ctx, `update wa_outbox set published_at = now(), unrouted = $2 where seq = $1`, seq, unrouted)
 	return err
+}
+
+// Unrouted counts events of the last day the broker confirmed but routed to no queue.
+func (s *Store) Unrouted(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.Pool.QueryRow(ctx, `select count(*) from wa_outbox where unrouted and published_at > now() - interval '1 day'`).Scan(&n)
+	return n, err
 }
 
 // OutboxBacklog is how many events wait for the broker, and how old the oldest is.

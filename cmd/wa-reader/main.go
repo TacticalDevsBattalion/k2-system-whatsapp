@@ -91,44 +91,56 @@ func run() error {
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return shutdown(srv, nil, nil, log)
+			return shutdown(srv, log)
 		}
 		return err
 	}
-	h.owner.Store(true)
 	log.Info("Owner lock acquired", "clientId", cfg.ClientID)
 
-	if err := mgr.Start(ctx); err != nil {
-		log.Error("WhatsApp did not start; the session endpoints stay up", "err", err)
+	// The session's work (WhatsApp, the outbox pump, pruning) runs under its own context, cancelled
+	// the moment ownership ends — before HTTP is drained, so no second owner overlaps with us.
+	ownerCtx, endOwnership := context.WithCancel(ctx)
+	defer endOwnership()
+	if err := mgr.Start(ownerCtx); err != nil {
+		// The session store is unusable; holding the lock would keep any other replica out too.
+		lock.Release()
+		_ = shutdown(srv, log)
+		return fmt.Errorf("whatsapp start: %w", err)
 	}
-	go pub.Run(ctx)
-	go prune(ctx, st, cfg, log)
+	h.owner.Store(true)
+	go pub.Run(ownerCtx)
+	go prune(ownerCtx, st, cfg, log)
 
+	stopSession := func() {
+		h.owner.Store(false)
+		endOwnership()
+		mgr.Stop()
+		lock.Release()
+	}
 	select {
 	case <-ctx.Done():
 		log.Info("Shutting down")
+		// In-flight sends finish first (they need the session), then the session stops.
+		err := shutdown(srv, log)
+		stopSession()
+		return err
 	case err := <-srvErr:
-		_ = shutdown(srv, mgr, lock, log)
+		stopSession()
+		_ = shutdown(srv, log)
 		return err
 	case <-lock.Lost:
-		log.Error("Lost the owner lock (database connection gone); stopping so another replica can take over")
-		_ = shutdown(srv, mgr, lock, log)
+		log.Error("Lost the owner lock; stopping the session at once so another replica can take over")
+		stopSession()
+		_ = shutdown(srv, log)
 		return errors.New("owner lock lost")
 	}
-	return shutdown(srv, mgr, lock, log)
 }
 
-func shutdown(srv *http.Server, mgr *wa.Manager, lock *store.OwnerLock, log *slog.Logger) error {
+func shutdown(srv *http.Server, log *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	err := srv.Shutdown(ctx)
-	if mgr != nil {
-		mgr.Stop()
-	}
-	if lock != nil {
-		lock.Release()
-	}
-	log.Info("Stopped")
+	log.Info("HTTP stopped")
 	return err
 }
 

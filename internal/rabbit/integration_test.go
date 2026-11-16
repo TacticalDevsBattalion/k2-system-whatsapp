@@ -87,6 +87,29 @@ func TestStoreAndPublisher(t *testing.T) {
 	if got, err := st.FindMessage(ctx, "", "3EB0TEST"); err != nil || got.Chat != chat || *got.Body != body {
 		t.Fatalf("FindMessage: %+v %v", got, err)
 	}
+	// the same message redelivered under another chat id (a @lid mapped to a number meanwhile)
+	relabelled := msg
+	relabelled.Chat = "123456789012345@lid"
+	if fresh, err := st.SaveInbound(ctx, relabelled, &store.OutboxEvent{AMQPMessageID: "other-id", Chat: relabelled.Chat, Event: "created", Payload: payload}); err != nil || fresh {
+		t.Fatalf("redelivery under another chat id not deduplicated: %v %v", fresh, err)
+	}
+	// concurrent starts migrate without racing
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() { errs <- st.Migrate(ctx) }()
+	}
+	for i := 0; i < 3; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migrate: %v", err)
+		}
+	}
+	// an event for a chat no queue is bound for: confirmed, marked unrouted, does not block the outbox
+	unbound := "120363999999999999@g.us"
+	upayload, _ := json.Marshal(map[string]any{"event": "created", "id": "false_" + unbound + "_X"})
+	if _, err := st.SaveInbound(ctx, store.Message{Chat: unbound, ID: "3EB0UNBOUND", Sender: "380500000001@c.us", Time: time.Now(), Type: "chat"},
+		&store.OutboxEvent{AMQPMessageID: "false_" + unbound + "_3EB0UNBOUND", Chat: unbound, Event: "created", Payload: upayload}); err != nil {
+		t.Fatal(err)
+	}
 
 	// ── a consumer bound on the chatId header, as report-parser is ──
 	conn, err := amqp.Dial(amqpURL)
@@ -131,6 +154,9 @@ func TestStoreAndPublisher(t *testing.T) {
 	}
 	if !pub.Connected() {
 		t.Fatal("publisher reports disconnected")
+	}
+	if n, err := st.Unrouted(ctx); err != nil || n != 1 {
+		t.Fatalf("unrouted = %d %v, want 1 (the unbound chat)", n, err)
 	}
 
 	// ── idempotency keys ──

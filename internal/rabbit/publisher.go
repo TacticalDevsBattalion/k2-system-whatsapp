@@ -103,13 +103,15 @@ func (p *Publisher) session(ctx context.Context) error {
 		return err
 	}
 	closed := conn.NotifyClose(make(chan *amqp.Error, 1))
+	// mandatory: the broker hands back an event no queue is bound for, before confirming it.
+	returns := ch.NotifyReturn(make(chan amqp.Return, 16))
 	p.setConnected(true)
 	p.log.Info("Connected to RabbitMQ", "exchange", p.cfg.Exchange)
 
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
-		if err := p.drain(ctx, ch); err != nil {
+		if err := p.drain(ctx, ch, returns); err != nil {
 			return err
 		}
 		select {
@@ -128,7 +130,7 @@ func (p *Publisher) session(ctx context.Context) error {
 
 // drain publishes owed events oldest first, one at a time with a confirm each: order matters to a
 // consumer reading a chat, and the volume is a few messages a minute.
-func (p *Publisher) drain(ctx context.Context, ch *amqp.Channel) error {
+func (p *Publisher) drain(ctx context.Context, ch *amqp.Channel, returns <-chan amqp.Return) error {
 	for {
 		events, err := p.store.PendingOutbox(ctx, p.cfg.PublishBatch)
 		if err != nil {
@@ -138,7 +140,7 @@ func (p *Publisher) drain(ctx context.Context, ch *amqp.Channel) error {
 			return nil
 		}
 		for _, e := range events {
-			conf, err := ch.PublishWithDeferredConfirmWithContext(ctx, p.cfg.Exchange, "", false, false, amqp.Publishing{
+			conf, err := ch.PublishWithDeferredConfirmWithContext(ctx, p.cfg.Exchange, "", true, false, amqp.Publishing{
 				Headers:      amqp.Table{"chatId": e.Chat, "event": e.Event},
 				ContentType:  "application/json",
 				DeliveryMode: amqp.Persistent,
@@ -158,10 +160,27 @@ func (p *Publisher) drain(ctx context.Context, ch *amqp.Channel) error {
 			if !ok {
 				return errors.New("broker nacked publish " + e.AMQPMessageID)
 			}
-			if err := p.store.MarkPublished(ctx, e.Seq); err != nil {
+			// A return for this message arrives before its confirm.
+			unrouted := false
+			for drained := false; !drained; {
+				select {
+				case r := <-returns:
+					if r.MessageId == e.AMQPMessageID {
+						unrouted = true
+					}
+				default:
+					drained = true
+				}
+			}
+			if err := p.store.MarkPublished(ctx, e.Seq, unrouted); err != nil {
 				return err
 			}
-			p.log.Info("Event published", "event", e.Event, "chatId", e.Chat, "messageId", e.AMQPMessageID)
+			if unrouted {
+				p.log.Error("Event reached the exchange but no queue is bound for its chat — no consumer got it",
+					"event", e.Event, "chatId", e.Chat, "messageId", e.AMQPMessageID, "exchange", p.cfg.Exchange)
+			} else {
+				p.log.Info("Event published", "event", e.Event, "chatId", e.Chat, "messageId", e.AMQPMessageID)
+			}
 		}
 		if len(events) < p.cfg.PublishBatch {
 			return nil

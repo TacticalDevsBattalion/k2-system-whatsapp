@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -78,7 +79,10 @@ var migrations = []string{
 		event           text        not null,
 		payload         jsonb       not null,
 		created_at      timestamptz not null default now(),
-		published_at    timestamptz
+		published_at    timestamptz,
+		-- confirmed by the broker but routed to no queue (no binding for the chat): not lost
+		-- silently — counted in /health and logged
+		unrouted        boolean     not null default false
 	);
 	create index if not exists wa_outbox_pending on wa_outbox (seq) where published_at is null;
 
@@ -101,33 +105,37 @@ var migrations = []string{
 	);`,
 }
 
+// Migrate applies pending migrations in one transaction under a transaction-level advisory lock,
+// so replicas starting together neither race nor apply a migration twice.
 func (s *Store) Migrate(ctx context.Context) error {
-	if _, err := s.Pool.Exec(ctx, `create table if not exists wa_schema_version (version integer not null)`); err != nil {
-		return fmt.Errorf("schema version table: %w", err)
-	}
-	var current int
-	if err := s.Pool.QueryRow(ctx, `select coalesce(max(version), 0) from wa_schema_version`).Scan(&current); err != nil {
-		return err
-	}
-	for i := current; i < len(migrations); i++ {
-		err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `select pg_advisory_xact_lock($1)`, lockKey("migrations")); err != nil {
+			return fmt.Errorf("migration lock: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `create table if not exists wa_schema_version (version integer primary key)`); err != nil {
+			return fmt.Errorf("schema version table: %w", err)
+		}
+		var current int
+		if err := tx.QueryRow(ctx, `select coalesce(max(version), 0) from wa_schema_version`).Scan(&current); err != nil {
+			return err
+		}
+		for i := current; i < len(migrations); i++ {
 			if _, err := tx.Exec(ctx, migrations[i]); err != nil {
+				return fmt.Errorf("migration %d: %w", i+1, err)
+			}
+			if _, err := tx.Exec(ctx, `insert into wa_schema_version (version) values ($1)`, i+1); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, `insert into wa_schema_version (version) values ($1)`, i+1)
-			return err
-		})
-		if err != nil {
-			return fmt.Errorf("migration %d: %w", i+1, err)
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // OwnerLock is a session advisory lock held on a dedicated connection. While it is held this
 // process is the only one allowed to connect the WhatsApp session; WhatsApp itself replaces one
 // of two connections on the same device ("stream replaced"), and two would fight for ever.
 type OwnerLock struct {
+	mu   sync.Mutex // a pgx.Conn is not safe for concurrent use: watch and Release share it
 	conn *pgx.Conn
 	// Lost is closed when the lock's connection dies; the holder must stop using the session.
 	Lost chan struct{}
@@ -173,20 +181,34 @@ func (s *Store) AcquireOwnerLock(ctx context.Context, clientID string, onWait fu
 	return l, nil
 }
 
+// watch checks that the lock is still held by this very backend: a dead
+// connection, or a DSN that goes through a pooler which hands out another backend, both show here.
 func (l *OwnerLock) watch() {
 	defer close(l.Lost)
+	// Every second: once the server drops this backend (or the network is cut) a standby can take
+	// the lock at once, so the overlap is bounded by this interval plus the query timeout.
 	for {
-		time.Sleep(5 * time.Second)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := l.conn.Ping(ctx)
+		time.Sleep(time.Second)
+		l.mu.Lock()
+		if l.conn.IsClosed() {
+			l.mu.Unlock()
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		var held bool
+		err := l.conn.QueryRow(ctx, `select exists(select 1 from pg_locks where locktype = 'advisory'
+			and pid = pg_backend_pid() and granted)`).Scan(&held)
 		cancel()
-		if err != nil {
+		l.mu.Unlock()
+		if err != nil || !held {
 			return
 		}
 	}
 }
 
 func (l *OwnerLock) Release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	_ = l.conn.Close(context.Background())
 }
 

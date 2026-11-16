@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/skip2/go-qrcode"
@@ -46,6 +47,12 @@ type Manager struct {
 	container *sqlstore.Container
 	allow     map[string]bool
 
+	// life serializes everything that replaces the client or starts/stops a login: Login, Logout,
+	// PairCode, the server-side LoggedOut, Stop. Never held by the event handler of a message.
+	life    sync.Mutex
+	ctx     context.Context // the process context, set by Start
+	stopped atomic.Bool
+
 	mu        sync.RWMutex
 	client    *whatsmeow.Client
 	status    Status
@@ -68,40 +75,70 @@ func NewManager(cfg config.Config, st *store.Store, out Notifier, log *slog.Logg
 	}
 	return &Manager{
 		cfg: cfg, st: st, out: out, log: log, waLog: slogAdapter{log.With("module", "whatsmeow")},
-		allow: allow, status: StatusInitializing, statusChg: make(chan struct{}),
+		allow: allow, status: StatusInitializing, statusChg: make(chan struct{}), ctx: context.Background(),
 	}
 }
 
 // Start opens the session store and connects. A linked device reconnects silently; without one
-// the manager starts a QR login right away, as 1.x did on first run.
+// the manager starts a QR login right away, as 1.x did on first run. An error here means the
+// session store is unusable: the caller should exit and let another start try again.
 func (m *Manager) Start(ctx context.Context) error {
 	waStore.SetOSInfo(m.cfg.DeviceName, [3]uint32{2, 0, 0})
 	waStore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
-	m.container = sqlstore.NewWithDB(m.st.SQL, "postgres", m.waLog.Sub("store"))
-	if err := m.container.Upgrade(ctx); err != nil {
+	container := sqlstore.NewWithDB(m.st.SQL, "postgres", m.waLog.Sub("store"))
+	if err := container.Upgrade(ctx); err != nil {
 		return fmt.Errorf("whatsmeow store upgrade: %w", err)
 	}
-	device, err := m.container.GetFirstDevice(ctx)
+	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		return fmt.Errorf("load device: %w", err)
 	}
-	m.newClient(device)
-	return m.connect(context.Background())
+	m.life.Lock()
+	defer m.life.Unlock()
+	m.ctx, m.container = ctx, container
+	cli := m.newClient(device)
+	if cli.Store.ID == nil {
+		return m.startQR(cli)
+	}
+	m.setStatus(StatusInitializing)
+	if err := cli.Connect(); err != nil {
+		// whatsmeow reconnects on its own only after a first successful connection: until then a
+		// network outage at start would leave the gateway down for good. Keep trying.
+		m.setStatus(StatusDisconnected)
+		m.log.Warn("WhatsApp connect failed; retrying", "err", err)
+		go m.retryConnect(cli)
+	}
+	return nil
 }
 
-func (m *Manager) newClient(device *waStore.Device) {
+// newClient builds a client for device and makes it current. Callers hold m.life.
+func (m *Manager) newClient(device *waStore.Device) *whatsmeow.Client {
 	cli := whatsmeow.NewClient(device, m.waLog)
-	// Ack an inbound message only after the handler has written it (and its event) to Postgres:
-	// a crash before that makes WhatsApp redeliver instead of the message being lost.
+	// Ack an inbound message only after the handler has written it (and its event) to Postgres.
+	// The handler reports failure (a write that never succeeded, a panic) as false: whatsmeow then
+	// keeps the plaintext in its decrypted-event buffer and sends no ack, so the message comes back.
 	cli.SynchronousAck = true
 	cli.EnableDecryptedEventBuffer = true
 	cli.UseRetryMessageStore = true
 	cli.AutomaticMessageRerequestFromPhone = true
 	cli.GetMessageForRetry = m.messageForRetry
-	cli.AddEventHandler(m.handleEvent)
+	cli.AddEventHandlerWithSuccessStatus(func(evt any) (ok bool) {
+		defer func() {
+			if v := recover(); v != nil {
+				m.log.Error("Event handler panicked; the event is not acked and will be redelivered", "event", fmt.Sprintf("%T", evt), "panic", fmt.Sprint(v))
+				ok = false
+			}
+		}()
+		if m.cli() != cli {
+			return true // a discarded client (after logout): nothing it says is current
+		}
+		return m.handleEvent(cli, evt)
+	})
 	m.mu.Lock()
 	m.client = cli
 	m.mu.Unlock()
+	m.groups.reset()
+	return cli
 }
 
 func (m *Manager) cli() *whatsmeow.Client {
@@ -110,61 +147,46 @@ func (m *Manager) cli() *whatsmeow.Client {
 	return m.client
 }
 
-func (m *Manager) connect(ctx context.Context) error {
-	cli := m.cli()
-	if cli.Store.ID == nil {
-		return m.startQR(ctx)
-	}
-	m.setStatus(StatusInitializing)
-	if err := cli.Connect(); err != nil {
-		// whatsmeow reconnects on its own only after a first successful connection: until then a
-		// network outage at start would leave the gateway down for good. Keep trying.
-		m.setStatus(StatusDisconnected)
-		m.log.Warn("WhatsApp connect failed; retrying", "err", err)
-		go m.retryConnect(ctx, cli)
-	}
-	return nil
-}
-
-func (m *Manager) retryConnect(ctx context.Context, cli *whatsmeow.Client) {
+func (m *Manager) retryConnect(cli *whatsmeow.Client) {
 	delay := 2 * time.Second
 	for {
 		select {
-		case <-ctx.Done():
+		case <-m.ctx.Done():
 			return
 		case <-time.After(delay):
 		}
-		if m.cli() != cli || cli.IsConnected() || cli.Store.ID == nil {
-			return // replaced by a login/logout, or connected meanwhile
+		m.life.Lock()
+		if m.stopped.Load() || m.cli() != cli || cli.IsConnected() || cli.Store.ID == nil {
+			m.life.Unlock()
+			return // stopped, replaced by a login/logout, or connected meanwhile
 		}
 		err := cli.Connect()
+		m.life.Unlock()
 		if err == nil || errors.Is(err, whatsmeow.ErrAlreadyConnected) {
 			return
 		}
-		m.log.Warn("WhatsApp connect failed; retrying", "err", err, "in", (delay * 2).String())
 		if delay < time.Minute {
 			delay *= 2
 		}
+		m.log.Warn("WhatsApp connect failed; retrying", "err", err, "in", delay.String())
 	}
 }
 
 // startQR connects an unlinked client and keeps the current QR available until it is scanned or
 // WhatsApp stops issuing codes (about two minutes), after which the session is logged out until
-// the next POST /session/login.
-func (m *Manager) startQR(ctx context.Context) error {
-	cli := m.cli()
-	qctx, cancel := context.WithCancel(context.Background())
+// the next POST /session/login. Callers hold m.life.
+func (m *Manager) startQR(cli *whatsmeow.Client) error {
+	if m.qrCancel != nil {
+		m.qrCancel()
+		m.qrCancel = nil
+	}
+	qctx, cancel := context.WithCancel(m.ctx)
 	ch, err := cli.GetQRChannel(qctx)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("qr channel: %w", err)
 	}
-	m.mu.Lock()
-	if m.qrCancel != nil {
-		m.qrCancel()
-	}
 	m.qrCancel = cancel
-	m.mu.Unlock()
 	if err := cli.Connect(); err != nil {
 		cancel()
 		m.setStatus(StatusLoggedOut)
@@ -172,6 +194,9 @@ func (m *Manager) startQR(ctx context.Context) error {
 	}
 	go func() {
 		for item := range ch {
+			if m.cli() != cli {
+				continue // drained after a logout replaced this client
+			}
 			switch item.Event {
 			case whatsmeow.QRChannelEventCode:
 				png, err := qrcode.Encode(item.Code, qrcode.Medium, 512)
@@ -250,12 +275,6 @@ func (m *Manager) Ready() bool {
 	return m.Status() == StatusReady && cli != nil && cli.IsLoggedIn()
 }
 
-// Linked reports whether a device is linked (the session survives a restart).
-func (m *Manager) Linked() bool {
-	cli := m.cli()
-	return cli != nil && cli.Store.ID != nil
-}
-
 // waitFor blocks until the status is one of want, or the timeout passes.
 func (m *Manager) waitFor(ctx context.Context, timeout time.Duration, want ...Status) Status {
 	deadline := time.NewTimer(timeout)
@@ -279,25 +298,38 @@ func (m *Manager) waitFor(ctx context.Context, timeout time.Duration, want ...St
 	}
 }
 
+// ErrNotStarted means the session store is not open (Start has not succeeded).
+var ErrNotStarted = errors.New("session not started")
+
 // Login starts a session if none is running and waits until it shows a QR or is ready.
 func (m *Manager) Login(ctx context.Context) (Status, error) {
+	m.life.Lock()
+	cli := m.cli()
+	if cli == nil {
+		m.life.Unlock()
+		return m.Status(), ErrNotStarted
+	}
 	switch m.Status() {
 	case StatusReady, StatusAuthenticated, StatusQR:
+		m.life.Unlock()
 		return m.Status(), nil
 	}
-	cli := m.cli()
 	if cli.Store.ID != nil {
 		if !cli.IsConnected() {
-			if err := cli.Connect(); err != nil {
+			if err := cli.Connect(); err != nil && !errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+				m.life.Unlock()
 				return m.Status(), err
 			}
 		}
+		m.life.Unlock()
 		return m.waitFor(ctx, m.cfg.LoginWait, StatusReady), nil
 	}
 	if cli.IsConnected() {
 		cli.Disconnect()
 	}
-	if err := m.startQR(ctx); err != nil {
+	err := m.startQR(cli)
+	m.life.Unlock()
+	if err != nil {
 		return m.Status(), err
 	}
 	return m.waitFor(ctx, m.cfg.LoginWait, StatusQR, StatusReady, StatusAuthenticated), nil
@@ -307,13 +339,16 @@ func (m *Manager) Login(ctx context.Context) (Status, error) {
 // the next Login. unlinked is false when WhatsApp could not be told (the local session is
 // dropped anyway, and the phone may still list the device until it is removed there).
 func (m *Manager) Logout(ctx context.Context) (unlinked bool, err error) {
+	m.life.Lock()
+	defer m.life.Unlock()
 	cli := m.cli()
-	m.mu.Lock()
+	if cli == nil {
+		return false, ErrNotStarted
+	}
 	if m.qrCancel != nil {
 		m.qrCancel()
 		m.qrCancel = nil
 	}
-	m.mu.Unlock()
 	m.clearQR()
 	if cli.Store.ID != nil {
 		if err := cli.Logout(ctx); err == nil {
@@ -341,6 +376,8 @@ func (m *Manager) PairCode(ctx context.Context, phone string) (string, error) {
 			return "", err
 		}
 	}
+	m.life.Lock()
+	defer m.life.Unlock()
 	if m.Status() != StatusQR {
 		return "", ErrNoPendingLogin
 	}
@@ -350,19 +387,34 @@ func (m *Manager) PairCode(ctx context.Context, phone string) (string, error) {
 // ErrNoPendingLogin means a pairing was asked for while no login is waiting.
 var ErrNoPendingLogin = errors.New("no login pending")
 
-// Stop disconnects cleanly. The session stays linked.
+// Stop disconnects for good: nothing reconnects afterwards. The session stays linked.
 func (m *Manager) Stop() {
+	m.stopped.Store(true)
+	m.life.Lock()
+	defer m.life.Unlock()
+	if m.qrCancel != nil {
+		m.qrCancel()
+	}
 	if cli := m.cli(); cli != nil {
 		cli.Disconnect()
 	}
 }
 
-func (m *Manager) handleEvent(evt any) {
+// handleEvent reports false only when an inbound message could not be recorded: whatsmeow then
+// withholds the ack and the message is delivered again.
+func (m *Manager) handleEvent(cli *whatsmeow.Client, evt any) bool {
 	switch e := evt.(type) {
+	case *events.Message:
+		ok := m.handleMessage(e)
+		if !ok {
+			// Redelivery comes with the next connection; do not wait for one to happen by itself.
+			go m.reconnectAfterFailure(cli)
+		}
+		return ok
 	case *events.Connected:
 		m.setStatus(StatusReady)
 		m.setError("")
-		if id := m.cli().Store.ID; id != nil {
+		if id := cli.Store.ID; id != nil {
 			m.log.Info("WhatsApp client is ready", "account", id.User)
 		}
 	case *events.PairSuccess:
@@ -377,11 +429,16 @@ func (m *Manager) handleEvent(evt any) {
 	case *events.KeepAliveRestored:
 		m.log.Info("WhatsApp keepalive restored")
 	case *events.LoggedOut:
+		// whatsmeow has already deleted the device from the store.
 		m.log.Error("WhatsApp logged this device out; POST /session/login and scan a new QR", "onConnect", e.OnConnect, "reason", e.Reason.String())
 		m.setError("logged out: " + e.Reason.String())
 		go func() {
-			m.newClient(m.container.NewDevice())
-			m.setStatus(StatusLoggedOut)
+			m.life.Lock()
+			defer m.life.Unlock()
+			if m.cli() == cli && !m.stopped.Load() {
+				m.newClient(m.container.NewDevice())
+				m.setStatus(StatusLoggedOut)
+			}
 		}()
 	case *events.StreamReplaced:
 		m.log.Error("Another connection took over this WhatsApp device (stream replaced); not reconnecting")
@@ -399,12 +456,36 @@ func (m *Manager) handleEvent(evt any) {
 		m.setError("client outdated")
 	case *events.OfflineSyncCompleted:
 		m.log.Info("Offline messages delivered", "count", e.Count)
-	case *events.Message:
-		m.handleMessage(e)
 	case *events.HistorySync:
 		m.handleHistorySync(e)
 	case *events.UndecryptableMessage:
 		m.log.Warn("Message could not be decrypted; WhatsApp will retry", "chatId", e.Info.Chat.String(), "id", e.Info.ID, "unavailable", e.IsUnavailable)
+	}
+	return true
+}
+
+var reconnecting atomic.Bool
+
+func (m *Manager) reconnectAfterFailure(cli *whatsmeow.Client) {
+	if !reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	defer reconnecting.Store(false)
+	select {
+	case <-m.ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+	m.life.Lock()
+	defer m.life.Unlock()
+	if m.stopped.Load() || m.cli() != cli || cli.Store.ID == nil {
+		return
+	}
+	m.log.Warn("Reconnecting so WhatsApp redelivers the unrecorded message")
+	cli.Disconnect()
+	if err := cli.Connect(); err != nil {
+		m.log.Warn("Reconnect failed; retrying", "err", err)
+		go m.retryConnect(cli)
 	}
 }
 

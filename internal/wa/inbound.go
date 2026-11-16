@@ -63,12 +63,13 @@ func (m *Manager) chatOf(ctx context.Context, info types.MessageInfo) string {
 
 func (m *Manager) allowed(chat string) bool { return len(m.allow) == 0 || m.allow[chat] }
 
-func (m *Manager) handleMessage(evt *events.Message) {
+// handleMessage reports false when the message (or its event) could not be recorded.
+func (m *Manager) handleMessage(evt *events.Message) bool {
 	ctx := context.Background()
 	info := evt.Info
 	if info.IsFromMe {
 		// 1.x forwarded only what others wrote (whatsapp-web.js `message`, not `message_create`).
-		return
+		return true
 	}
 	chat := m.chatOf(ctx, info)
 	author := ""
@@ -79,16 +80,16 @@ func (m *Manager) handleMessage(evt *events.Message) {
 	if pm := evt.Message.GetProtocolMessage(); pm != nil {
 		switch pm.GetType() {
 		case waE2E.ProtocolMessage_REVOKE:
-			m.handleRevoke(ctx, chat, author, info, pm)
+			return m.handleRevoke(ctx, chat, author, info, pm)
 		case waE2E.ProtocolMessage_MESSAGE_EDIT:
-			m.handleEdit(ctx, chat, author, info, pm)
+			return m.handleEdit(ctx, chat, author, info, pm)
 		}
-		return
+		return true
 	}
 
 	c, ok := describe(evt.Message)
 	if !ok {
-		return
+		return true
 	}
 	key := ids.MessageKey{Chat: chat, ID: info.ID, Participant: author}
 	body := c.Body
@@ -106,8 +107,8 @@ func (m *Manager) handleMessage(evt *events.Message) {
 	}
 	fresh, err := retryDB(func() (bool, error) { return m.st.SaveInbound(ctx, rec, out) })
 	if err != nil {
-		m.log.Error("Inbound message NOT recorded — it will be lost if WhatsApp does not redeliver", "chatId", chat, "id", info.ID, "err", err)
-		return
+		m.log.Error("Inbound message not recorded; withholding the ack so WhatsApp redelivers it", "chatId", chat, "id", info.ID, "err", err)
+		return false
 	}
 	m.touchChat(ctx, chat, info.Timestamp, info.PushName, info.IsGroup)
 	switch {
@@ -119,21 +120,23 @@ func (m *Manager) handleMessage(evt *events.Message) {
 		m.log.Info("Message received", "chatId", chat, "messageId", key.String(), "type", c.Type, "hasMedia", c.HasMedia)
 		m.out.Notify()
 	}
+	return true
 }
 
-func (m *Manager) handleEdit(ctx context.Context, chat, author string, info types.MessageInfo, pm *waE2E.ProtocolMessage) {
+func (m *Manager) handleEdit(ctx context.Context, chat, author string, info types.MessageInfo, pm *waE2E.ProtocolMessage) bool {
 	origID := pm.GetKey().GetID()
 	c, ok := describe(pm.GetEditedMessage())
 	if origID == "" || !ok {
-		return
+		return true
 	}
 	orig, err := m.st.FindMessage(ctx, chat, origID)
 	var prev *string
 	origType, origTS, hasMedia := c.Type, info.Timestamp, c.HasMedia
 	if err == nil {
 		prev, origType, origTS, hasMedia = orig.Body, firstNonEmpty(orig.Type, c.Type), orig.Time, orig.HasMedia
+		chat, author = orig.Chat, originalAuthor(orig, author)
 		if prev != nil && *prev == c.Body {
-			return
+			return true
 		}
 	}
 	key := ids.MessageKey{Chat: chat, ID: origID, Participant: author}
@@ -148,28 +151,32 @@ func (m *Manager) handleEdit(ctx context.Context, chat, author string, info type
 	}
 	fresh, err := retryDB(func() (bool, error) { return m.st.SaveEvent(ctx, chat, origID, &body, "", out) })
 	if err != nil {
-		m.log.Error("Edit NOT recorded", "chatId", chat, "id", origID, "err", err)
-		return
+		m.log.Error("Edit not recorded; withholding the ack so WhatsApp redelivers it", "chatId", chat, "id", origID, "err", err)
+		return false
 	}
 	if fresh && out != nil {
 		m.log.Info("Message edited", "chatId", chat, "messageId", key.String())
 		m.out.Notify()
 	}
+	return true
 }
 
-func (m *Manager) handleRevoke(ctx context.Context, chat, author string, info types.MessageInfo, pm *waE2E.ProtocolMessage) {
+func (m *Manager) handleRevoke(ctx context.Context, chat, author string, info types.MessageInfo, pm *waE2E.ProtocolMessage) bool {
 	origID := pm.GetKey().GetID()
 	if origID == "" {
-		return
+		return true
 	}
 	ev := Event{Event: "deleted", ChatID: chat, From: chat, Author: author, Timestamp: info.Timestamp.Unix(), DeletedAt: time.Now().Unix()}
-	if orig, err := m.st.FindMessage(ctx, chat, origID); err == nil {
-		ev.Body, ev.Type, ev.Timestamp, ev.HasMedia = orig.Body, orig.Type, orig.Time.Unix(), orig.HasMedia
-	} else {
+	orig, err := m.st.FindMessage(ctx, chat, origID)
+	if err != nil {
 		// 1.x skipped a deletion of a message it never saw: there is nothing for a consumer to undo.
 		m.log.Debug("Deletion of a message never recorded; skipped", "chatId", chat, "id", origID)
-		return
+		return true
 	}
+	// The key names the message's own author, not an admin who deleted it, so it matches `created`.
+	chat, author = orig.Chat, originalAuthor(orig, author)
+	ev.ChatID, ev.From, ev.Author = chat, chat, author
+	ev.Body, ev.Type, ev.Timestamp, ev.HasMedia = orig.Body, orig.Type, orig.Time.Unix(), orig.HasMedia
 	key := ids.MessageKey{Chat: chat, ID: origID, Participant: author}
 	ev.ID = key.String()
 	var out *store.OutboxEvent
@@ -178,13 +185,27 @@ func (m *Manager) handleRevoke(ctx context.Context, chat, author string, info ty
 	}
 	fresh, err := retryDB(func() (bool, error) { return m.st.SaveEvent(ctx, chat, origID, nil, "revoked", out) })
 	if err != nil {
-		m.log.Error("Deletion NOT recorded", "chatId", chat, "id", origID, "err", err)
-		return
+		m.log.Error("Deletion not recorded; withholding the ack so WhatsApp redelivers it", "chatId", chat, "id", origID, "err", err)
+		return false
 	}
 	if fresh && out != nil {
 		m.log.Info("Message deleted", "chatId", chat, "messageId", key.String())
 		m.out.Notify()
 	}
+	return true
+}
+
+// originalAuthor is the author part of a recorded message's key: its sender in a group or a status
+// thread, nobody in a one-to-one chat.
+func originalAuthor(orig store.Message, fallback string) string {
+	switch orig.Chat {
+	case "":
+		return fallback
+	}
+	if k := ids.KindOf(orig.Chat); k == ids.KindGroup || k == ids.KindBroadcast {
+		return orig.Sender
+	}
+	return ""
 }
 
 func outbox(chat, event, amqpID string, e Event) *store.OutboxEvent {
