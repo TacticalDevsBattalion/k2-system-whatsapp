@@ -27,6 +27,8 @@ Swagger UI at **`GET /docs`**, raw spec at `GET /openapi.json` (both honour `PAT
   `GET /ready` (200 only when a send can go out).
 - Session: `GET /session`, `POST /session/login`, `POST /session/logout`, `GET /session/qr` (302 → `GET /qr`, PNG),
   and new in 2.0 `POST /session/pair-code` `{phoneNumber}` — link with an 8-character code typed on the phone.
+  While no device is linked, a fresh QR is issued by itself whenever the previous one expires (2.1.0), also
+  after WhatsApp unlinks the device; only `POST /session/logout` leaves the gateway logged out until the next login.
 
 Paths, bodies, status codes and error codes (`WA_NOT_LOGGED_IN`, `WA_NOT_READY`, `WA_CHAT_ID_INVALID`,
 `WA_CHAT_NOT_FOUND`, `WA_NUMBER_NOT_FOUND`, `WA_SEND_FAILED`, `WA_SEND_IN_FLIGHT`, `BAD_ATTACHMENT`,

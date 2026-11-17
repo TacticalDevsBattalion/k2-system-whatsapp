@@ -59,6 +59,7 @@ type Manager struct {
 	qrCode    string
 	qrPNG     []byte
 	qrCancel  context.CancelFunc
+	qrRound   uint64 // bumped by every startQR: a renewal scheduled for an older round is dropped
 	statusChg chan struct{}
 	lastError string
 
@@ -172,14 +173,17 @@ func (m *Manager) retryConnect(cli *whatsmeow.Client) {
 	}
 }
 
-// startQR connects an unlinked client and keeps the current QR available until it is scanned or
-// WhatsApp stops issuing codes (about two minutes), after which the session is logged out until
-// the next POST /session/login. Callers hold m.life.
+// startQR connects an unlinked client and keeps the current QR available until it is scanned.
+// WhatsApp stops issuing codes after about two minutes; a new round then starts by itself (as in
+// 1.x), so an unlinked gateway always has a QR to scan. Only POST /session/logout leaves it
+// logged out. Callers hold m.life.
 func (m *Manager) startQR(cli *whatsmeow.Client) error {
 	if m.qrCancel != nil {
 		m.qrCancel()
 		m.qrCancel = nil
 	}
+	m.qrRound++
+	round := m.qrRound
 	qctx, cancel := context.WithCancel(m.ctx)
 	ch, err := cli.GetQRChannel(qctx)
 	if err != nil {
@@ -215,8 +219,9 @@ func (m *Manager) startQR(cli *whatsmeow.Client) error {
 			case whatsmeow.QRChannelTimeout.Event:
 				m.clearQR()
 				cli.Disconnect()
-				m.setStatus(StatusLoggedOut)
-				m.log.Warn("Login QR expired without a scan; POST /session/login to get a new one")
+				m.setStatus(StatusInitializing)
+				m.log.Info("Login QR expired without a scan; issuing a new one")
+				go m.renewQR(cli, round)
 			default:
 				m.clearQR()
 				if item.Error != nil {
@@ -225,12 +230,46 @@ func (m *Manager) startQR(cli *whatsmeow.Client) error {
 				m.log.Warn("Login did not complete", "event", item.Event, "err", item.Error)
 				if cli.Store.ID == nil {
 					cli.Disconnect()
-					m.setStatus(StatusLoggedOut)
+					m.setStatus(StatusInitializing)
+					go m.renewQR(cli, round)
 				}
 			}
 		}
 	}()
 	return nil
+}
+
+// qrRenewDelay is the pause before a new QR round; it doubles while rounds fail to start.
+var qrRenewDelay = 5 * time.Second
+
+// renewQR starts the next QR round for cli unless something else took over meanwhile: a scan, a
+// newer round (POST /session/login), a logout, or shutdown.
+func (m *Manager) renewQR(cli *whatsmeow.Client, round uint64) {
+	delay := qrRenewDelay
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		m.life.Lock()
+		if m.stopped.Load() || m.cli() != cli || cli.Store.ID != nil || m.qrRound != round {
+			m.life.Unlock()
+			return
+		}
+		err := m.startQR(cli)
+		if err == nil {
+			m.life.Unlock()
+			return
+		}
+		round = m.qrRound // the failed attempt is the current round now
+		m.setStatus(StatusInitializing)
+		m.life.Unlock()
+		if delay < time.Minute {
+			delay *= 2
+		}
+		m.log.Warn("New login QR could not be issued; retrying", "err", err, "in", delay.String())
+	}
 }
 
 func (m *Manager) clearQR() {
@@ -430,14 +469,18 @@ func (m *Manager) handleEvent(cli *whatsmeow.Client, evt any) bool {
 		m.log.Info("WhatsApp keepalive restored")
 	case *events.LoggedOut:
 		// whatsmeow has already deleted the device from the store.
-		m.log.Error("WhatsApp logged this device out; POST /session/login and scan a new QR", "onConnect", e.OnConnect, "reason", e.Reason.String())
+		m.log.Error("WhatsApp logged this device out; scan the new QR at GET /qr", "onConnect", e.OnConnect, "reason", e.Reason.String())
 		m.setError("logged out: " + e.Reason.String())
 		go func() {
 			m.life.Lock()
 			defer m.life.Unlock()
 			if m.cli() == cli && !m.stopped.Load() {
-				m.newClient(m.container.NewDevice())
+				next := m.newClient(m.container.NewDevice())
 				m.setStatus(StatusLoggedOut)
+				if err := m.startQR(next); err != nil {
+					m.log.Warn("Login QR could not be issued; retrying", "err", err)
+					go m.renewQR(next, m.qrRound)
+				}
 			}
 		}()
 	case *events.StreamReplaced:
