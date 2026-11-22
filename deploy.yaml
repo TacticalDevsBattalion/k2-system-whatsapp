@@ -11,7 +11,8 @@
 #     longer described here — kubectl apply (no --prune) leaves it; delete it by hand once 2.x is
 #     settled and 1.x will not be rolled back to (rolling back needs that volume: 1.x's session).
 #   * DATABASE_URL comes from Secret wa-reader-db, made by ~/k2-security/pg-roles/wa-reader-pg-whatsapp.sh
-#     on master (with the pg-whatsapp CA in ConfigMap pg-whatsapp-ca and NetworkPolicy
+#     on master (sslmode=verify-full; since 2026-11-22 pg-whatsapp's certificate is from the k2 CA, trusted
+#     through the image's system store — no CA ConfigMap; NetworkPolicy
 #     database/allow-wa-reader-to-pg-whatsapp). It points straight at pg-whatsapp-rw, NOT pgbouncer:
 #     the single-owner lock is a session advisory lock.
 #   * Only the owner of that lock connects WhatsApp; readiness (/health/owner) is true only there, so
@@ -112,10 +113,6 @@ spec:
             # DATABASE_URL. Required: the pod does not start without it (the session lives there).
             - secretRef:
                 name: ${SERVICE_NAME}-db
-          volumeMounts:
-            - name: pg-ca
-              mountPath: /etc/pg-ca
-              readOnly: true
           startupProbe:
             httpGet:
               path: /health
@@ -145,10 +142,6 @@ spec:
             limits:
               cpu: "1000m"
               memory: "256Mi"
-      volumes:
-        - name: pg-ca
-          configMap:
-            name: pg-whatsapp-ca
 ---
 apiVersion: v1
 kind: Service
