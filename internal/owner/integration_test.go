@@ -102,11 +102,18 @@ func TestLockLossAgainstPostgres(t *testing.T) {
 	}
 	waitStart("after the lock backend was terminated")
 
-	ownerMu.Lock()
-	if !owner {
-		t.Error("not owner after re-acquiring")
+	// setOwner(true) follows Start: give it a moment.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		ownerMu.Lock()
+		o := owner
+		ownerMu.Unlock()
+		if o {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("not owner after re-acquiring")
+		}
 	}
-	ownerMu.Unlock()
 	stopRun()
 	if err := <-done; err != nil {
 		t.Fatalf("Run: %v", err)
