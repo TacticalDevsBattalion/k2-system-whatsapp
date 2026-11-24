@@ -67,6 +67,15 @@ but only the holder of a Postgres **session advisory lock** (keyed by `WHATSAPP_
 drains the outbox; readiness is true only there. When the owner stops, a standby takes over in about a second
 (measured: 1.1 s). This is why `DATABASE_URL` must reach Postgres directly, not through pgbouncer in transaction mode.
 
+**Postgres going away** (a CNPG primary restart or switchover) does not stop the process (2.1.2). At start the
+first connection is retried for `DATABASE_CONNECT_RETRY_MS`. Only temporary errors are retried: refused or reset
+connections, timeouts, DNS, SQLSTATE `08…` and `57P01`–`57P03`. A wrong password, a missing database or a
+certificate that does not verify fail at once. When the owner lock's connection dies at run time, the session is
+paused: readiness drops, WhatsApp is disconnected, the outbox pump stops, and sends answer `503 WA_NOT_READY`.
+The lock is then taken again on a fresh connection, and the session resumes from Postgres with no new QR. Nothing
+is sent or published before that, so two owners never overlap. If Postgres stays away longer than
+`DATABASE_OUTAGE_MAX_MS`, the process exits for Kubernetes to restart it.
+
 ## Configuration
 
 | Variable | Default | |
@@ -74,6 +83,7 @@ drains the outbox; readiness is true only there. When the owner stops, a standby
 | `DATABASE_URL` | — (required) | Postgres DSN; tables go to the role's `search_path` |
 | `PORT`, `PATH_BASE`, `LOG_LEVEL` | `3000`, `""`, `info` | `PATH_BASE` is stripped like ASP.NET `UsePathBase` |
 | `WHATSAPP_CLIENT_ID` | `default` | names the session and its owner lock |
+| `DATABASE_CONNECT_RETRY_MS`, `DATABASE_OUTAGE_MAX_MS` | 60000, 300000 | how long Postgres may be away at start; at run time, before the process exits |
 | `WHATSAPP_MESSAGE_DELAY_MS` | `3000` | minimum gap between outbound messages |
 | `WHATSAPP_LOGIN_WAIT_MS` | `60000` | how long `POST /session/login` waits for a QR |
 | `WHATSAPP_DEVICE_NAME` | `K2 WhatsApp Gateway` | shown on the phone under Linked devices |
@@ -97,6 +107,8 @@ docker build --add-host k2:10.20.50.25 --pull -t wa-reader .
 
 Layout: `cmd/wa-reader` (start order, shutdown), `internal/api` (REST, OpenAPI, Swagger UI embedded),
 `internal/wa` (whatsmeow session, inbound, sends, chats), `internal/store` (Postgres: migrations, outbox, cache,
-idempotency, owner lock), `internal/rabbit` (outbox pump), `internal/ids` (1.x id dialect).
+idempotency, owner lock), `internal/owner` (owner loop: pause on a lost lock, take it again, resume),
+`internal/dbretry` (which Postgres errors are worth retrying, backoff), `internal/rabbit` (outbox pump),
+`internal/ids` (1.x id dialect).
 
 Version: `VERSION` (baked into the binary); release notes: `changelog/`.

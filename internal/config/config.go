@@ -25,6 +25,11 @@ type Config struct {
 	// ClientID names the session. Two instances with different ids never contend for the
 	// owner lock and keep separate devices in the same database.
 	ClientID string
+	// DatabaseConnectRetry is how long the first connection at start is retried while Postgres
+	// is briefly away; DatabaseOutageMax is how long a running gateway waits for it to come back
+	// (session paused) before it exits.
+	DatabaseConnectRetry time.Duration
+	DatabaseOutageMax    time.Duration
 
 	MessageDelay   time.Duration
 	LoginWait      time.Duration
@@ -50,17 +55,19 @@ type RabbitConfig struct {
 
 func Load() (Config, error) {
 	c := Config{
-		Port:            num("PORT", 3000),
-		PathBase:        NormalizePathBase(os.Getenv("PATH_BASE")),
-		LogLevel:        strings.ToLower(str("LOG_LEVEL", "info")),
-		DatabaseURL:     strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		ClientID:        str("WHATSAPP_CLIENT_ID", "default"),
-		MessageDelay:    ms("WHATSAPP_MESSAGE_DELAY_MS", 3000),
-		LoginWait:       ms("WHATSAPP_LOGIN_WAIT_MS", 60000),
-		DeviceName:      str("WHATSAPP_DEVICE_NAME", "K2 WhatsApp Gateway"),
-		MessageTTL:      time.Duration(num("WHATSAPP_HISTORY_RETENTION_SEC", 7*24*3600)) * time.Second,
-		IdempotencyTTL:  ms("IDEMPOTENCY_TTL_MS", 7*24*3600*1000),
-		InFlightTimeout: ms("IDEMPOTENCY_IN_FLIGHT_TIMEOUT_MS", 5*60*1000),
+		Port:                 num("PORT", 3000),
+		PathBase:             NormalizePathBase(os.Getenv("PATH_BASE")),
+		LogLevel:             strings.ToLower(str("LOG_LEVEL", "info")),
+		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		ClientID:             str("WHATSAPP_CLIENT_ID", "default"),
+		DatabaseConnectRetry: ms("DATABASE_CONNECT_RETRY_MS", 60000),
+		DatabaseOutageMax:    ms("DATABASE_OUTAGE_MAX_MS", 5*60*1000),
+		MessageDelay:         ms("WHATSAPP_MESSAGE_DELAY_MS", 3000),
+		LoginWait:            ms("WHATSAPP_LOGIN_WAIT_MS", 60000),
+		DeviceName:           str("WHATSAPP_DEVICE_NAME", "K2 WhatsApp Gateway"),
+		MessageTTL:           time.Duration(num("WHATSAPP_HISTORY_RETENTION_SEC", 7*24*3600)) * time.Second,
+		IdempotencyTTL:       ms("IDEMPOTENCY_TTL_MS", 7*24*3600*1000),
+		InFlightTimeout:      ms("IDEMPOTENCY_IN_FLIGHT_TIMEOUT_MS", 5*60*1000),
 		Rabbit: RabbitConfig{
 			URL:            strings.TrimSpace(os.Getenv("RABBITMQ_URL")),
 			Exchange:       str("RABBITMQ_EXCHANGE", "whatsapp.messages"),
