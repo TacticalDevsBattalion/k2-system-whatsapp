@@ -137,20 +137,44 @@ func (s *Store) Migrate(ctx context.Context) error {
 type OwnerLock struct {
 	mu   sync.Mutex // a pgx.Conn is not safe for concurrent use: watch and Release share it
 	conn *pgx.Conn
-	// Lost is closed when the lock's connection dies; the holder must stop using the session.
-	Lost chan struct{}
+	lost chan struct{}
+	// cause is written by watch before it closes lost.
+	cause error
 }
+
+// Lost is closed when the lock's connection dies or the lock is found gone; the holder must stop
+// using the session at once.
+func (l *OwnerLock) Lost() <-chan struct{} { return l.lost }
+
+// Cause says why the lock was lost; only meaningful once Lost is closed.
+func (l *OwnerLock) Cause() error {
+	select {
+	case <-l.lost:
+		return l.cause
+	default:
+		return nil
+	}
+}
+
+const (
+	lockConnectTimeout = 10 * time.Second
+	lockQueryTimeout   = 5 * time.Second
+)
 
 // AcquireOwnerLock blocks until the lock for clientID is free or ctx ends. onWait is called once
 // if the lock is busy, so the caller can say why it is not starting.
 func (s *Store) AcquireOwnerLock(ctx context.Context, clientID string, onWait func()) (*OwnerLock, error) {
-	conn, err := pgx.Connect(ctx, s.dsn)
+	// Each round trip is bounded: while Postgres is away (a primary restart) the caller retries,
+	// and an unreachable address must fail in seconds, not after the kernel's SYN retries.
+	cctx, cancel := context.WithTimeout(ctx, lockConnectTimeout)
+	defer cancel()
+	conn, err := pgx.Connect(cctx, s.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("lock connection: %w", err)
 	}
 	// If this pod's node drops off the network, Postgres must notice the dead connection and free
 	// the lock in seconds, not after the kernel's two-hour keepalive default.
-	if _, err := conn.Exec(ctx, `set tcp_keepalives_idle = 10; set tcp_keepalives_interval = 5; set tcp_keepalives_count = 3`); err != nil {
+	if _, err := conn.Exec(cctx, `set tcp_keepalives_idle = 10; set tcp_keepalives_interval = 5; set tcp_keepalives_count = 3`); err != nil {
 		_ = conn.Close(context.Background())
 		return nil, fmt.Errorf("lock keepalives: %w", err)
 	}
@@ -158,8 +182,14 @@ func (s *Store) AcquireOwnerLock(ctx context.Context, clientID string, onWait fu
 	waited := false
 	for {
 		var ok bool
-		if err := conn.QueryRow(ctx, `select pg_try_advisory_lock($1)`, key).Scan(&ok); err != nil {
+		qctx, qcancel := context.WithTimeout(ctx, lockQueryTimeout)
+		err := conn.QueryRow(qctx, `select pg_try_advisory_lock($1)`, key).Scan(&ok)
+		qcancel()
+		if err != nil {
 			_ = conn.Close(context.Background())
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, fmt.Errorf("advisory lock: %w", err)
 		}
 		if ok {
@@ -176,7 +206,7 @@ func (s *Store) AcquireOwnerLock(ctx context.Context, clientID string, onWait fu
 		case <-time.After(2 * time.Second):
 		}
 	}
-	l := &OwnerLock{conn: conn, Lost: make(chan struct{})}
+	l := &OwnerLock{conn: conn, lost: make(chan struct{})}
 	go l.watch()
 	return l, nil
 }
@@ -184,7 +214,7 @@ func (s *Store) AcquireOwnerLock(ctx context.Context, clientID string, onWait fu
 // watch checks that the lock is still held by this very backend: a dead
 // connection, or a DSN that goes through a pooler which hands out another backend, both show here.
 func (l *OwnerLock) watch() {
-	defer close(l.Lost)
+	defer close(l.lost)
 	// Every second: once the server drops this backend (or the network is cut) a standby can take
 	// the lock at once, so the overlap is bounded by this interval plus the query timeout.
 	for {
@@ -192,6 +222,7 @@ func (l *OwnerLock) watch() {
 		l.mu.Lock()
 		if l.conn.IsClosed() {
 			l.mu.Unlock()
+			l.cause = errors.New("lock connection closed")
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -200,7 +231,12 @@ func (l *OwnerLock) watch() {
 			and pid = pg_backend_pid() and granted)`).Scan(&held)
 		cancel()
 		l.mu.Unlock()
-		if err != nil || !held {
+		if err != nil {
+			l.cause = fmt.Errorf("lock check: %w", err)
+			return
+		}
+		if !held {
+			l.cause = errors.New("advisory lock no longer held by this backend")
 			return
 		}
 	}
@@ -211,6 +247,9 @@ func (l *OwnerLock) Release() {
 	defer l.mu.Unlock()
 	_ = l.conn.Close(context.Background())
 }
+
+// LockKey is the advisory lock key of clientID's owner lock (exported for tests and diagnostics).
+func LockKey(clientID string) int64 { return lockKey(clientID) }
 
 func lockKey(clientID string) int64 {
 	h := fnv.New64a()

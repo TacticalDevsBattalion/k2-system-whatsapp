@@ -54,6 +54,9 @@ func (e *SendError) Unwrap() error { return e.Err }
 
 func (m *Manager) requireReady() (*whatsmeow.Client, error) {
 	cli := m.cli()
+	if cli == nil && m.stopped.Load() {
+		return nil, ErrNotReady // paused: the owner lock is being taken again
+	}
 	if cli == nil || cli.Store.ID == nil {
 		return nil, ErrNotLoggedIn
 	}

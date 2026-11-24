@@ -50,10 +50,10 @@ type Manager struct {
 	// life serializes everything that replaces the client or starts/stops a login: Login, Logout,
 	// PairCode, the server-side LoggedOut, Stop. Never held by the event handler of a message.
 	life    sync.Mutex
-	ctx     context.Context // the process context, set by Start
-	stopped atomic.Bool
+	stopped atomic.Bool // between Stop and the next Start: the owner lock is not held
 
 	mu        sync.RWMutex
+	ctx       context.Context // the ownership context of the current Start; read with runCtx
 	client    *whatsmeow.Client
 	status    Status
 	qrCode    string
@@ -81,8 +81,10 @@ func NewManager(cfg config.Config, st *store.Store, out Notifier, log *slog.Logg
 }
 
 // Start opens the session store and connects. A linked device reconnects silently; without one
-// the manager starts a QR login right away, as 1.x did on first run. An error here means the
-// session store is unusable: the caller should exit and let another start try again.
+// the manager starts a QR login right away, as 1.x did on first run. ctx is the ownership term:
+// it ends when the owner lock does. Start may be called again after Stop (the lock was lost and
+// taken again); the session is then loaded afresh from the store. An error here means the
+// session store is unusable for now: the caller stops, and retries or exits.
 func (m *Manager) Start(ctx context.Context) error {
 	waStore.SetOSInfo(m.cfg.DeviceName, [3]uint32{2, 0, 0})
 	waStore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
@@ -96,12 +98,19 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.life.Lock()
 	defer m.life.Unlock()
-	m.ctx, m.container = ctx, container
+	if ctx.Err() != nil {
+		return ctx.Err() // ownership ended while the store was loading
+	}
+	m.mu.Lock()
+	m.ctx = ctx
+	m.mu.Unlock()
+	m.container = container
+	m.stopped.Store(false)
 	cli := m.newClient(device)
+	m.setStatus(StatusInitializing)
 	if cli.Store.ID == nil {
 		return m.startQR(cli)
 	}
-	m.setStatus(StatusInitializing)
 	if err := cli.Connect(); err != nil {
 		// whatsmeow reconnects on its own only after a first successful connection: until then a
 		// network outage at start would leave the gateway down for good. Keep trying.
@@ -142,6 +151,13 @@ func (m *Manager) newClient(device *waStore.Device) *whatsmeow.Client {
 	return cli
 }
 
+// runCtx is the context of the current ownership term (Background before the first Start).
+func (m *Manager) runCtx() context.Context {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ctx
+}
+
 func (m *Manager) cli() *whatsmeow.Client {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -152,7 +168,7 @@ func (m *Manager) retryConnect(cli *whatsmeow.Client) {
 	delay := 2 * time.Second
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-m.runCtx().Done():
 			return
 		case <-time.After(delay):
 		}
@@ -184,7 +200,7 @@ func (m *Manager) startQR(cli *whatsmeow.Client) error {
 	}
 	m.qrRound++
 	round := m.qrRound
-	qctx, cancel := context.WithCancel(m.ctx)
+	qctx, cancel := context.WithCancel(m.runCtx())
 	ch, err := cli.GetQRChannel(qctx)
 	if err != nil {
 		cancel()
@@ -248,7 +264,7 @@ func (m *Manager) renewQR(cli *whatsmeow.Client, round uint64) {
 	delay := qrRenewDelay
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-m.runCtx().Done():
 			return
 		case <-time.After(delay):
 		}
@@ -426,16 +442,25 @@ func (m *Manager) PairCode(ctx context.Context, phone string) (string, error) {
 // ErrNoPendingLogin means a pairing was asked for while no login is waiting.
 var ErrNoPendingLogin = errors.New("no login pending")
 
-// Stop disconnects for good: nothing reconnects afterwards. The session stays linked.
+// Stop disconnects and drops the client: nothing reconnects, sends, logs in or acks until the
+// next Start. The session stays linked (it is in Postgres). Called when ownership ends — at
+// shutdown, or when the owner lock is lost and another replica may take the device.
 func (m *Manager) Stop() {
 	m.stopped.Store(true)
 	m.life.Lock()
 	defer m.life.Unlock()
 	if m.qrCancel != nil {
 		m.qrCancel()
+		m.qrCancel = nil
 	}
-	if cli := m.cli(); cli != nil {
+	m.clearQR()
+	cli := m.cli()
+	m.mu.Lock()
+	m.client = nil // events still in flight from cli are ignored (m.cli() != cli)
+	m.mu.Unlock()
+	if cli != nil {
 		cli.Disconnect()
+		m.setStatus(StatusDisconnected)
 	}
 }
 
@@ -515,7 +540,7 @@ func (m *Manager) reconnectAfterFailure(cli *whatsmeow.Client) {
 	}
 	defer reconnecting.Store(false)
 	select {
-	case <-m.ctx.Done():
+	case <-m.runCtx().Done():
 		return
 	case <-time.After(30 * time.Second):
 	}
