@@ -82,6 +82,7 @@ is sent or published before that, so two owners never overlap. If Postgres stays
 |---|---|---|
 | `DATABASE_URL` | — (required) | Postgres DSN; tables go to the role's `search_path` |
 | `PORT`, `PATH_BASE`, `LOG_LEVEL` | `3000`, `""`, `info` | `PATH_BASE` is stripped like ASP.NET `UsePathBase` |
+| `API_DOCS_ORIGIN` | `""` | exact origin of the API docs site (`https://api-docs.kub.k2.lan`): CORS with credentials for it only, on the API routes (not `/docs`, `/openapi.json`); empty = no CORS |
 | `WHATSAPP_CLIENT_ID` | `default` | names the session and its owner lock |
 | `DATABASE_CONNECT_RETRY_MS`, `DATABASE_OUTAGE_MAX_MS` | 60000, 300000 | how long Postgres may be away at start; at run time, before the process exits |
 | `WHATSAPP_MESSAGE_DELAY_MS` | `3000` | minimum gap between outbound messages |

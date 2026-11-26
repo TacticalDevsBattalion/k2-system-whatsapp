@@ -18,6 +18,9 @@ type Config struct {
 	Port     int
 	PathBase string
 	LogLevel string
+	// APIDocsOrigin is the exact origin of the API docs site (https://api-docs.kub.k2.lan): only it
+	// gets CORS, with credentials, on the API routes («Try it out»). Empty: no CORS.
+	APIDocsOrigin string
 
 	// DatabaseURL is a Postgres DSN. It must reach the database directly, not through
 	// pgbouncer in transaction mode: the single-owner lock is a session advisory lock.
@@ -58,6 +61,7 @@ func Load() (Config, error) {
 		Port:                 num("PORT", 3000),
 		PathBase:             NormalizePathBase(os.Getenv("PATH_BASE")),
 		LogLevel:             strings.ToLower(str("LOG_LEVEL", "info")),
+		APIDocsOrigin:        strings.TrimRight(strings.TrimSpace(os.Getenv("API_DOCS_ORIGIN")), "/"),
 		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		ClientID:             str("WHATSAPP_CLIENT_ID", "default"),
 		DatabaseConnectRetry: ms("DATABASE_CONNECT_RETRY_MS", 60000),
