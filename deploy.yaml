@@ -28,6 +28,8 @@ metadata:
 data:
   PORT: "3000"
   PATH_BASE: ${BASE_PATH}
+  # «Try it out» Документації API: CORS (з credentials) лише для цього origin, без сторінок /docs і спеки.
+  API_DOCS_ORIGIN: https://api-docs.kub.k2.lan
   LOG_LEVEL: "info"
   # Names the session (and its owner lock). Two instances with different ids keep separate devices.
   WHATSAPP_CLIENT_ID: "default"

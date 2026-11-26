@@ -82,7 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("Route not found: %s %s", r.Method, r.URL.Path), nil)
 	})
-	return s.recoverer(pathBase(s.cfg.PathBase, mux))
+	return s.recoverer(pathBase(s.cfg.PathBase, cors(s.cfg.APIDocsOrigin, mux)))
 }
 
 // pathBase strips PATH_BASE like ASP.NET UsePathBase: /whatsapp/messages/send and /messages/send
